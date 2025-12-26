@@ -443,20 +443,38 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
 
     # 构建 tool_use_id -> tool_name 的映射,用于填充 functionResponse.name
     tool_use_map: Dict[str, str] = {}
-    for msg in messages:
+    # 从同一消息中的 thinking 块提取签名，用于关联到后续的 tool_use
+    message_thinking_signatures: Dict[int, List[str]] = {}
+
+    for msg_idx, msg in enumerate(messages):
         raw_content = msg.get("content", "")
         if isinstance(raw_content, list):
+            # 先收集该消息中所有 thinking 块的签名
+            thinking_sigs_in_msg: List[str] = []
             for item in raw_content:
-                if isinstance(item, dict) and item.get("type") == "tool_use":
-                    tool_id = item.get("id")
-                    tool_name = item.get("name")
-                    if tool_id and tool_name:
-                        tool_use_map[str(tool_id)] = str(tool_name)
+                if isinstance(item, dict):
+                    item_type = item.get("type")
+                    if item_type in ("thinking", "redacted_thinking"):
+                        sig = item.get("signature")
+                        if sig:
+                            thinking_sigs_in_msg.append(str(sig))
+                    elif item_type == "tool_use":
+                        tool_id = item.get("id")
+                        tool_name = item.get("name")
+                        if tool_id and tool_name:
+                            tool_use_map[str(tool_id)] = str(tool_name)
+            if thinking_sigs_in_msg:
+                message_thinking_signatures[msg_idx] = thinking_sigs_in_msg
 
-    for msg in messages:
+    for msg_idx, msg in enumerate(messages):
         role = msg.get("role", "user")
         gemini_role = "model" if role == "assistant" else "user"
         raw_content = msg.get("content", "")
+        # 获取该消息中的 thinking 签名列表（用于回退）
+        msg_thinking_sigs = message_thinking_signatures.get(msg_idx, [])
+        thinking_sig_index = 0
+        # 记录最后一个可用的签名，用于复用给后续没有对应签名的 tool_use
+        last_available_sig: Optional[str] = None
 
         parts: List[Dict[str, Any]] = []
         if isinstance(raw_content, str):
@@ -472,12 +490,14 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
                 item_type = item.get("type")
                 if item_type == "thinking":
                     # Anthropic 的历史 thinking block 在回放时通常要求携带 signature；
-                    # 若缺失 signature，下游可能会报 “thinking.signature: Field required”。
+                    # 若缺失 signature，下游可能会报 "thinking.signature: Field required"。
                     # 为保证兼容性，这里选择丢弃无 signature 的 thinking block。
                     signature = item.get("signature")
                     if not signature:
                         continue
 
+                    # 记录最后一个可用的签名
+                    last_available_sig = signature
                     thinking_text = item.get("thinking", "")
                     if thinking_text is None:
                         thinking_text = ""
@@ -492,6 +512,8 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
                     if not signature:
                         continue
 
+                    # 记录最后一个可用的签名
+                    last_available_sig = signature
                     # redacted_thinking 的具体字段在不同客户端可能不同，这里尽量兼容 data/thinking。
                     thinking_text = item.get("thinking")
                     if thinking_text is None:
@@ -526,14 +548,22 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
                         "args": item.get("input", {}) or {},
                     }
                     # 附加 thoughtSignature（如果存在），用于满足 Gemini API 的要求
-                    # 优先从扩展字段获取，其次从缓存获取
-                    # 注意：thoughtSignature 应该放在 part 级别，而不是 functionCall 内部
+                    # 优先级：1. 扩展字段 2. 缓存查询 3. 同消息中的 thinking 签名 4. 最后一个可用签名
                     thought_signature = item.get("_thought_signature")
                     if not thought_signature and tool_id:
                         thought_signature = get_cached_thought_signature(str(tool_id))
+                    # 如果仍然没有签名，尝试从同一消息的 thinking 块获取
+                    if not thought_signature and msg_thinking_sigs and thinking_sig_index < len(msg_thinking_sigs):
+                        thought_signature = msg_thinking_sigs[thinking_sig_index]
+                        thinking_sig_index += 1
+                    # 如果还是没有签名，使用最后一个可用的签名（复用）
+                    if not thought_signature and last_available_sig:
+                        thought_signature = last_available_sig
                     part_obj: Dict[str, Any] = {"functionCall": function_call}
                     if thought_signature:
                         part_obj["thoughtSignature"] = thought_signature
+                        # 更新最后可用签名
+                        last_available_sig = thought_signature
                     parts.append(part_obj)
                 elif item_type == "tool_result":
                     output = _extract_tool_result_output(item.get("content"))
@@ -574,10 +604,26 @@ async def convert_messages_to_contents_async(messages: List[Dict[str, Any]]) -> 
     tool_use_map: Dict[str, str] = {}
     # 同时收集所有需要查询签名的 tool_use_id
     tool_use_ids_to_query: List[str] = []
+    # 从同一消息中的 thinking 块提取签名，用于关联到后续的 tool_use
+    # 格式: {message_index: [signature1, signature2, ...]}
+    message_thinking_signatures: Dict[int, List[str]] = {}
 
-    for msg in messages:
+    for msg_idx, msg in enumerate(messages):
         raw_content = msg.get("content", "")
         if isinstance(raw_content, list):
+            # 先收集该消息中所有 thinking 块的签名
+            thinking_sigs_in_msg: List[str] = []
+            for item in raw_content:
+                if isinstance(item, dict):
+                    item_type = item.get("type")
+                    if item_type in ("thinking", "redacted_thinking"):
+                        sig = item.get("signature")
+                        if sig:
+                            thinking_sigs_in_msg.append(str(sig))
+            if thinking_sigs_in_msg:
+                message_thinking_signatures[msg_idx] = thinking_sigs_in_msg
+
+            # 再收集 tool_use 信息
             for item in raw_content:
                 if isinstance(item, dict) and item.get("type") == "tool_use":
                     tool_id = item.get("id")
@@ -611,14 +657,28 @@ async def convert_messages_to_contents_async(messages: List[Dict[str, Any]]) -> 
                     signature_map[tool_id] = sig
                     # 回填内存缓存
                     _thought_signature_cache[tool_id] = (sig, time.time())
+                    if _anthropic_debug_enabled():
+                        log.info(f"[ANTHROPIC][thoughtSignature] 从持久化存储恢复签名: tool_id={tool_id}, len={len(sig)}")
+                else:
+                    if _anthropic_debug_enabled():
+                        log.warning(f"[ANTHROPIC][thoughtSignature] 持久化存储中未找到签名: tool_id={tool_id}")
         except Exception as e:
-            if _anthropic_debug_enabled():
-                log.warning(f"[ANTHROPIC] 批量查询 thoughtSignature 失败: {e}")
+            log.warning(f"[ANTHROPIC] 批量查询 thoughtSignature 失败: {e}")
 
-    for msg in messages:
+    # 记录最终的签名查询结果
+    if _anthropic_debug_enabled():
+        log.info(f"[ANTHROPIC][thoughtSignature] 查询结果: 需要查询={len(tool_use_ids_to_query)}, 内存命中={len(tool_use_ids_to_query) - len(ids_to_fetch_from_storage)}, 持久化命中={len(signature_map) - (len(tool_use_ids_to_query) - len(ids_to_fetch_from_storage))}, 未找到={len(ids_to_fetch_from_storage) - len([k for k in ids_to_fetch_from_storage if k in signature_map])}, 消息中thinking签名={sum(len(v) for v in message_thinking_signatures.values())}")
+
+    for msg_idx, msg in enumerate(messages):
         role = msg.get("role", "user")
         gemini_role = "model" if role == "assistant" else "user"
         raw_content = msg.get("content", "")
+        # 获取该消息中的 thinking 签名列表（用于回退）
+        msg_thinking_sigs = message_thinking_signatures.get(msg_idx, [])
+        # 用于跟踪当前消息中已使用的 thinking 签名索引
+        thinking_sig_index = 0
+        # 记录最后一个可用的签名，用于复用给后续没有对应签名的 tool_use
+        last_available_sig: Optional[str] = None
 
         parts: List[Dict[str, Any]] = []
         if isinstance(raw_content, str):
@@ -637,6 +697,8 @@ async def convert_messages_to_contents_async(messages: List[Dict[str, Any]]) -> 
                     if not signature:
                         continue
 
+                    # 记录最后一个可用的签名
+                    last_available_sig = signature
                     thinking_text = item.get("thinking", "")
                     if thinking_text is None:
                         thinking_text = ""
@@ -651,6 +713,8 @@ async def convert_messages_to_contents_async(messages: List[Dict[str, Any]]) -> 
                     if not signature:
                         continue
 
+                    # 记录最后一个可用的签名
+                    last_available_sig = signature
                     thinking_text = item.get("thinking")
                     if thinking_text is None:
                         thinking_text = item.get("data", "")
@@ -684,13 +748,29 @@ async def convert_messages_to_contents_async(messages: List[Dict[str, Any]]) -> 
                         "args": item.get("input", {}) or {},
                     }
                     # 附加 thoughtSignature（如果存在），用于满足 Gemini API 的要求
-                    # 优先从扩展字段获取，其次从预查询的 signature_map 获取
+                    # 优先级：1. 扩展字段 2. 缓存查询 3. 同消息中的 thinking 签名 4. 最后一个可用签名
                     thought_signature = item.get("_thought_signature")
                     if not thought_signature and tool_id:
                         thought_signature = signature_map.get(str(tool_id))
+                    # 如果仍然没有签名，尝试从同一消息的 thinking 块获取
+                    if not thought_signature and msg_thinking_sigs and thinking_sig_index < len(msg_thinking_sigs):
+                        thought_signature = msg_thinking_sigs[thinking_sig_index]
+                        thinking_sig_index += 1
+                        if _anthropic_debug_enabled():
+                            log.info(f"[ANTHROPIC][thoughtSignature] 从同消息thinking块获取签名: tool_id={tool_id}, len={len(thought_signature)}")
+                    # 如果还是没有签名，使用最后一个可用的签名（复用）
+                    if not thought_signature and last_available_sig:
+                        thought_signature = last_available_sig
+                        if _anthropic_debug_enabled():
+                            log.info(f"[ANTHROPIC][thoughtSignature] 复用最后可用签名: tool_id={tool_id}, len={len(thought_signature)}")
                     part_obj: Dict[str, Any] = {"functionCall": function_call}
                     if thought_signature:
                         part_obj["thoughtSignature"] = thought_signature
+                        # 更新最后可用签名
+                        last_available_sig = thought_signature
+                    else:
+                        # 记录警告：缺少签名可能导致 Gemini API 报错
+                        log.warning(f"[ANTHROPIC][thoughtSignature] tool_use 缺少签名: tool_id={tool_id}, name={item.get('name')}")
                     parts.append(part_obj)
                 elif item_type == "tool_result":
                     output = _extract_tool_result_output(item.get("content"))
