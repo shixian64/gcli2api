@@ -1329,6 +1329,66 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/config/model-mapping")
+async def get_model_mapping_config(token: str = Depends(verify_panel_token)):
+    """获取模型映射配置"""
+    try:
+        from src.anthropic_converter import (
+            DEFAULT_MODEL_MAPPING,
+            SUPPORTED_PASSTHROUGH_MODELS,
+            get_current_model_mapping,
+        )
+
+        current_mapping = await config.get_model_mapping()
+
+        return JSONResponse(content={
+            "model_mapping": current_mapping,
+            "default_mapping": DEFAULT_MODEL_MAPPING,
+            "supported_downstream_models": list(SUPPORTED_PASSTHROUGH_MODELS),
+        })
+
+    except Exception as e:
+        log.error(f"获取模型映射配置失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/config/model-mapping")
+async def save_model_mapping_config(request: Request, token: str = Depends(verify_panel_token)):
+    """保存模型映射配置"""
+    try:
+        data = await request.json()
+        new_mapping = data.get("model_mapping")
+
+        if not isinstance(new_mapping, dict):
+            raise HTTPException(status_code=400, detail="model_mapping 必须是字典类型")
+
+        # 验证映射值
+        from src.anthropic_converter import SUPPORTED_PASSTHROUGH_MODELS
+
+        for upstream, downstream in new_mapping.items():
+            if not isinstance(upstream, str) or not isinstance(downstream, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"映射键值必须是字符串: {upstream} -> {downstream}"
+                )
+
+        # 保存配置
+        await config.set_model_mapping(new_mapping)
+
+        log.info(f"模型映射配置已更新: {new_mapping}")
+
+        return JSONResponse(content={
+            "message": "模型映射配置保存成功",
+            "model_mapping": new_mapping,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"保存模型映射配置失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # =============================================================================
 # 实时日志WebSocket (Real-time Logs WebSocket)
 # =============================================================================

@@ -400,3 +400,38 @@ async def get_antigravity_api_url() -> str:
             "ANTIGRAVITY_API_URL",
         )
     )
+
+
+async def get_model_mapping() -> dict:
+    """
+    Get model mapping configuration.
+
+    用于配置上游模型到下游模型的映射关系。
+    可在前端配置界面修改，实时生效。
+
+    Database config key: model_mapping
+    Default: 使用 anthropic_converter.DEFAULT_MODEL_MAPPING
+    """
+    from src.anthropic_converter import DEFAULT_MODEL_MAPPING
+
+    mapping = await get_config_value("model_mapping")
+    if mapping and isinstance(mapping, dict):
+        return mapping
+
+    return DEFAULT_MODEL_MAPPING.copy()
+
+
+async def set_model_mapping(mapping: dict) -> None:
+    """
+    Set model mapping configuration.
+
+    保存模型映射配置到数据库，并更新运行时缓存。
+    """
+    from src.storage_adapter import get_storage_adapter
+    from src.anthropic_converter import update_model_mapping
+
+    storage_adapter = await get_storage_adapter()
+    await storage_adapter.set_config("model_mapping", mapping)
+
+    # 同步更新运行时缓存
+    update_model_mapping(mapping)
