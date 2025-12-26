@@ -48,8 +48,12 @@ class SQLiteManager:
             ("call_count", "INTEGER DEFAULT 0"),
             ("created_at", "REAL DEFAULT (unixepoch())"),
             ("updated_at", "REAL DEFAULT (unixepoch())")
-        ]
+        ],
+        "thought_signatures": []  # 简单表，无需额外列
     }
+
+    # thoughtSignature 缓存默认 TTL（24小时）
+    THOUGHT_SIGNATURE_TTL_SECONDS = 86400
 
     def __init__(self):
         self._db_path = None
@@ -221,6 +225,21 @@ class SQLiteManager:
                 value TEXT NOT NULL,
                 updated_at REAL DEFAULT (unixepoch())
             )
+        """)
+
+        # thoughtSignature 缓存表（用于 Anthropic -> Gemini 转换）
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS thought_signatures (
+                tool_use_id TEXT PRIMARY KEY,
+                signature TEXT NOT NULL,
+                created_at REAL DEFAULT (unixepoch())
+            )
+        """)
+
+        # 创建索引用于自动清理过期签名
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ts_created_at
+            ON thought_signatures(created_at)
         """)
 
         log.debug("SQLite tables and indexes created")
@@ -981,4 +1000,96 @@ class SQLiteManager:
 
         except Exception as e:
             log.error(f"Error clearing expired model cooldowns: {e}")
+            return 0
+
+    # ============ thoughtSignature 缓存管理 ============
+
+    async def save_thought_signature(self, tool_use_id: str, signature: str) -> bool:
+        """
+        保存 thoughtSignature 到持久化存储
+
+        Args:
+            tool_use_id: 工具调用 ID（如 toolu_xxx）
+            signature: Gemini 返回的 thoughtSignature
+
+        Returns:
+            是否成功
+        """
+        if not tool_use_id or not signature:
+            return False
+
+        self._ensure_initialized()
+
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                await db.execute("""
+                    INSERT INTO thought_signatures (tool_use_id, signature, created_at)
+                    VALUES (?, ?, unixepoch())
+                    ON CONFLICT(tool_use_id) DO UPDATE SET
+                        signature = excluded.signature,
+                        created_at = excluded.created_at
+                """, (tool_use_id, signature))
+                await db.commit()
+                return True
+
+        except Exception as e:
+            log.error(f"Error saving thought signature for {tool_use_id}: {e}")
+            return False
+
+    async def get_thought_signature(self, tool_use_id: str) -> Optional[str]:
+        """
+        获取 thoughtSignature
+
+        Args:
+            tool_use_id: 工具调用 ID
+
+        Returns:
+            签名字符串，如果不存在或已过期则返回 None
+        """
+        if not tool_use_id:
+            return None
+
+        self._ensure_initialized()
+
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                cutoff = time.time() - self.THOUGHT_SIGNATURE_TTL_SECONDS
+                async with db.execute("""
+                    SELECT signature FROM thought_signatures
+                    WHERE tool_use_id = ? AND created_at > ?
+                """, (tool_use_id, cutoff)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        return row[0]
+                    return None
+
+        except Exception as e:
+            log.error(f"Error getting thought signature for {tool_use_id}: {e}")
+            return None
+
+    async def cleanup_expired_thought_signatures(self) -> int:
+        """
+        清理过期的 thoughtSignature 缓存
+
+        Returns:
+            清理的记录数
+        """
+        self._ensure_initialized()
+
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                cutoff = time.time() - self.THOUGHT_SIGNATURE_TTL_SECONDS
+                result = await db.execute("""
+                    DELETE FROM thought_signatures WHERE created_at < ?
+                """, (cutoff,))
+                deleted_count = result.rowcount
+                await db.commit()
+
+                if deleted_count > 0:
+                    log.debug(f"Cleaned up {deleted_count} expired thought signatures")
+
+                return deleted_count
+
+        except Exception as e:
+            log.error(f"Error cleaning up expired thought signatures: {e}")
             return 0

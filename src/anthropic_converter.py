@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Union
 
 from log import log
@@ -10,6 +12,106 @@ from log import log
 
 DEFAULT_THINKING_BUDGET = 1024
 DEFAULT_TEMPERATURE = 0.4
+
+# 用于缓存 tool_use.id -> thoughtSignature 的映射
+# 使用带过期时间的内存缓存作为一级缓存，持久化存储作为二级缓存
+_thought_signature_cache: Dict[str, tuple[str, float]] = {}
+_CACHE_TTL_SECONDS = 86400  # 24小时过期（与持久化存储保持一致）
+
+
+def cache_thought_signature(tool_use_id: str, signature: str) -> None:
+    """
+    缓存 thoughtSignature（同步版本，仅写入内存缓存）
+
+    注意：此函数仅写入内存缓存，持久化存储需要调用 cache_thought_signature_async
+    """
+    if tool_use_id and signature:
+        _thought_signature_cache[tool_use_id] = (signature, time.time())
+        # 清理过期缓存
+        _cleanup_expired_cache()
+
+
+async def cache_thought_signature_async(tool_use_id: str, signature: str) -> None:
+    """
+    缓存 thoughtSignature（异步版本，同时写入内存缓存和持久化存储）
+    """
+    if not tool_use_id or not signature:
+        return
+
+    # 写入内存缓存
+    _thought_signature_cache[tool_use_id] = (signature, time.time())
+    _cleanup_expired_cache()
+
+    # 写入持久化存储
+    try:
+        from .storage_adapter import get_storage_adapter
+        storage = await get_storage_adapter()
+        await storage.save_thought_signature(tool_use_id, signature)
+    except Exception as e:
+        if _anthropic_debug_enabled():
+            log.warning(f"[ANTHROPIC] 持久化 thoughtSignature 失败: {e}")
+
+
+def get_cached_thought_signature(tool_use_id: str) -> Optional[str]:
+    """
+    获取缓存的 thoughtSignature（同步版本，仅从内存缓存读取）
+
+    注意：此函数仅从内存缓存读取，如需从持久化存储读取请使用 get_cached_thought_signature_async
+    """
+    if not tool_use_id:
+        return None
+    entry = _thought_signature_cache.get(tool_use_id)
+    if entry:
+        signature, timestamp = entry
+        if time.time() - timestamp < _CACHE_TTL_SECONDS:
+            return signature
+        else:
+            # 已过期，删除
+            del _thought_signature_cache[tool_use_id]
+    return None
+
+
+async def get_cached_thought_signature_async(tool_use_id: str) -> Optional[str]:
+    """
+    获取缓存的 thoughtSignature（异步版本，先查内存缓存，再查持久化存储）
+    """
+    if not tool_use_id:
+        return None
+
+    # 先查内存缓存
+    entry = _thought_signature_cache.get(tool_use_id)
+    if entry:
+        signature, timestamp = entry
+        if time.time() - timestamp < _CACHE_TTL_SECONDS:
+            return signature
+        else:
+            del _thought_signature_cache[tool_use_id]
+
+    # 再查持久化存储
+    try:
+        from .storage_adapter import get_storage_adapter
+        storage = await get_storage_adapter()
+        signature = await storage.get_thought_signature(tool_use_id)
+        if signature:
+            # 回填内存缓存
+            _thought_signature_cache[tool_use_id] = (signature, time.time())
+            return signature
+    except Exception as e:
+        if _anthropic_debug_enabled():
+            log.warning(f"[ANTHROPIC] 从持久化存储读取 thoughtSignature 失败: {e}")
+
+    return None
+
+
+def _cleanup_expired_cache() -> None:
+    """清理过期的缓存条目"""
+    now = time.time()
+    expired_keys = [
+        k for k, (_, ts) in _thought_signature_cache.items()
+        if now - ts >= _CACHE_TTL_SECONDS
+    ]
+    for k in expired_keys:
+        del _thought_signature_cache[k]
 
 
 def _anthropic_debug_enabled() -> bool:
@@ -89,12 +191,13 @@ def map_claude_model_to_gemini(claude_model: str) -> str:
     if claude_model == "claude-sonnet-4-5":
         return "claude-sonnet-4-5"
     if claude_model == "claude-haiku-4-5":
-        return "gemini-2.5-flash"
+        return "gemini-3-flash"
 
     supported_models = {
         "gemini-2.5-flash",
         "gemini-2.5-flash-thinking",
         "gemini-2.5-pro",
+        "gemini-3-flash",
         "gemini-3-pro-low",
         "gemini-3-pro-high",
         "gemini-3-pro-image",
@@ -114,8 +217,8 @@ def map_claude_model_to_gemini(claude_model: str) -> str:
         "claude-3-5-sonnet-20241022": "claude-sonnet-4-5",
         "claude-3-5-sonnet-20240620": "claude-sonnet-4-5",
         "claude-opus-4": "gemini-3-pro-high",
-        "claude-haiku-4": "claude-haiku-4.5",
-        "claude-3-haiku-20240307": "gemini-2.5-flash",
+        "claude-haiku-4": "gemini-3-flash",
+        "claude-3-haiku-20240307": "gemini-3-flash",
     }
 
     return model_mapping.get(claude_model, "claude-sonnet-4-5")
@@ -224,19 +327,71 @@ def clean_json_schema(schema: Any) -> Any:
 
 def convert_tools(anthropic_tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
     """
-    将 Anthropic tools[] 转换为下游 tools（functionDeclarations）结构。
+    将 Anthropic tools[] 转换为下游 tools 结构。
+
+    支持两类工具：
+    1. Anthropic 内置工具（如 web_search_20250305）-> 转换为 Gemini 对应工具（如 googleSearch）
+    2. 自定义 function tools -> 转换为 functionDeclarations
 
     Gemini API 要求: 所有函数声明应该在一个 functionDeclarations 数组中,
-    而不是每个函数一个独立的工具组。这样可以避免 "Multiple tools are
-    supported only when they are all search tools" 错误。
+    而不是每个函数一个独立的工具组。
     """
     if not anthropic_tools:
         return None
 
-    # 收集所有函数声明到一个列表中
+    # Anthropic 内置工具到 Gemini 工具的映射
+    # key: Anthropic 工具类型前缀, value: Gemini 工具格式
+    builtin_tool_mapping = {
+        "web_search": {"googleSearch": {}},
+        "code_execution": {"codeExecution": {}},
+        # 以下工具 Gemini 不支持
+        # "computer": None,
+        # "text_editor": None,
+        # "bash": None,
+    }
+
+    # 不支持转换的内置工具前缀
+    unsupported_builtin_prefixes = (
+        "computer",
+        "text_editor",
+        "bash",
+    )
+
+    # 收集结果
+    result_tools: List[Dict[str, Any]] = []
     all_function_declarations: List[Dict[str, Any]] = []
+    has_google_search = False
+    has_code_execution = False
 
     for tool in anthropic_tools:
+        tool_type = tool.get("type")
+
+        # 检查是否是内置工具
+        if tool_type:
+            # 标准 function tool 的 type 通常是 "function" 或 "custom"，或者没有 type 字段
+            if tool_type not in ("function", "custom"):
+                # 检查是否是可转换的内置工具
+                matched_builtin = None
+                for prefix, gemini_tool in builtin_tool_mapping.items():
+                    if tool_type.startswith(prefix):
+                        matched_builtin = gemini_tool
+                        break
+
+                if matched_builtin:
+                    # 避免重复添加相同的内置工具
+                    if "googleSearch" in matched_builtin and not has_google_search:
+                        result_tools.append(matched_builtin)
+                        has_google_search = True
+                    elif "codeExecution" in matched_builtin and not has_code_execution:
+                        result_tools.append(matched_builtin)
+                        has_code_execution = True
+                    continue
+
+                # 检查是否是不支持的内置工具
+                if any(tool_type.startswith(prefix) for prefix in unsupported_builtin_prefixes):
+                    continue
+
+        # 处理标准 function tool
         name = tool.get("name")
         if not name:
             continue
@@ -244,18 +399,24 @@ def convert_tools(anthropic_tools: Optional[List[Dict[str, Any]]]) -> Optional[L
         input_schema = tool.get("input_schema", {}) or {}
         parameters = clean_json_schema(input_schema)
 
+        # 确保 parameters 有 type 字段，下游 API 要求此字段
+        if not parameters.get("type"):
+            parameters["type"] = "object"
+
         all_function_declarations.append({
             "name": name,
             "description": description,
             "parameters": parameters,
         })
 
-    if not all_function_declarations:
+    # 添加 functionDeclarations（如果有）
+    if all_function_declarations:
+        result_tools.append({"functionDeclarations": all_function_declarations})
+
+    if not result_tools:
         return None
 
-    # 返回单个工具组,包含所有函数声明
-    # 这符合 Gemini API 的规范,避免多工具组导致的限制
-    return [{"functionDeclarations": all_function_declarations}]
+    return result_tools
 
 
 def _extract_tool_result_output(content: Any) -> str:
@@ -358,15 +519,22 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
                             }
                         )
                 elif item_type == "tool_use":
-                    parts.append(
-                        {
-                            "functionCall": {
-                                "id": item.get("id"),
-                                "name": item.get("name"),
-                                "args": item.get("input", {}) or {},
-                            }
-                        }
-                    )
+                    tool_id = item.get("id")
+                    function_call: Dict[str, Any] = {
+                        "id": tool_id,
+                        "name": item.get("name"),
+                        "args": item.get("input", {}) or {},
+                    }
+                    # 附加 thoughtSignature（如果存在），用于满足 Gemini API 的要求
+                    # 优先从扩展字段获取，其次从缓存获取
+                    # 注意：thoughtSignature 应该放在 part 级别，而不是 functionCall 内部
+                    thought_signature = item.get("_thought_signature")
+                    if not thought_signature and tool_id:
+                        thought_signature = get_cached_thought_signature(str(tool_id))
+                    part_obj: Dict[str, Any] = {"functionCall": function_call}
+                    if thought_signature:
+                        part_obj["thoughtSignature"] = thought_signature
+                    parts.append(part_obj)
                 elif item_type == "tool_result":
                     output = _extract_tool_result_output(item.get("content"))
                     tool_use_id = item.get("tool_use_id")
@@ -388,6 +556,161 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
                 parts = [{"text": str(raw_content)}]
 
         # 避免产生空 parts（下游可能会报错），直接跳过该条空消息。
+        if not parts:
+            continue
+
+        contents.append({"role": gemini_role, "parts": parts})
+
+    return contents
+
+
+async def convert_messages_to_contents_async(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    将 Anthropic messages[] 转换为下游 contents[]（异步版本，支持从持久化存储读取 thoughtSignature）。
+    """
+    contents: List[Dict[str, Any]] = []
+
+    # 构建 tool_use_id -> tool_name 的映射,用于填充 functionResponse.name
+    tool_use_map: Dict[str, str] = {}
+    # 同时收集所有需要查询签名的 tool_use_id
+    tool_use_ids_to_query: List[str] = []
+
+    for msg in messages:
+        raw_content = msg.get("content", "")
+        if isinstance(raw_content, list):
+            for item in raw_content:
+                if isinstance(item, dict) and item.get("type") == "tool_use":
+                    tool_id = item.get("id")
+                    tool_name = item.get("name")
+                    if tool_id and tool_name:
+                        tool_use_map[str(tool_id)] = str(tool_name)
+                    # 如果没有 _thought_signature，需要查询
+                    if tool_id and not item.get("_thought_signature"):
+                        tool_use_ids_to_query.append(str(tool_id))
+
+    # 批量查询 thoughtSignature（先查内存缓存，未命中的再查持久化存储）
+    signature_map: Dict[str, str] = {}
+    ids_to_fetch_from_storage: List[str] = []
+
+    for tool_id in tool_use_ids_to_query:
+        # 先查内存缓存
+        sig = get_cached_thought_signature(tool_id)
+        if sig:
+            signature_map[tool_id] = sig
+        else:
+            ids_to_fetch_from_storage.append(tool_id)
+
+    # 从持久化存储批量查询
+    if ids_to_fetch_from_storage:
+        try:
+            from .storage_adapter import get_storage_adapter
+            storage = await get_storage_adapter()
+            for tool_id in ids_to_fetch_from_storage:
+                sig = await storage.get_thought_signature(tool_id)
+                if sig:
+                    signature_map[tool_id] = sig
+                    # 回填内存缓存
+                    _thought_signature_cache[tool_id] = (sig, time.time())
+        except Exception as e:
+            if _anthropic_debug_enabled():
+                log.warning(f"[ANTHROPIC] 批量查询 thoughtSignature 失败: {e}")
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        gemini_role = "model" if role == "assistant" else "user"
+        raw_content = msg.get("content", "")
+
+        parts: List[Dict[str, Any]] = []
+        if isinstance(raw_content, str):
+            if _is_non_whitespace_text(raw_content):
+                parts = [{"text": str(raw_content)}]
+        elif isinstance(raw_content, list):
+            for item in raw_content:
+                if not isinstance(item, dict):
+                    if _is_non_whitespace_text(item):
+                        parts.append({"text": str(item)})
+                    continue
+
+                item_type = item.get("type")
+                if item_type == "thinking":
+                    signature = item.get("signature")
+                    if not signature:
+                        continue
+
+                    thinking_text = item.get("thinking", "")
+                    if thinking_text is None:
+                        thinking_text = ""
+                    part: Dict[str, Any] = {
+                        "text": str(thinking_text),
+                        "thought": True,
+                        "thoughtSignature": signature,
+                    }
+                    parts.append(part)
+                elif item_type == "redacted_thinking":
+                    signature = item.get("signature")
+                    if not signature:
+                        continue
+
+                    thinking_text = item.get("thinking")
+                    if thinking_text is None:
+                        thinking_text = item.get("data", "")
+                    parts.append(
+                        {
+                            "text": str(thinking_text or ""),
+                            "thought": True,
+                            "thoughtSignature": signature,
+                        }
+                    )
+                elif item_type == "text":
+                    text = item.get("text", "")
+                    if _is_non_whitespace_text(text):
+                        parts.append({"text": str(text)})
+                elif item_type == "image":
+                    source = item.get("source", {}) or {}
+                    if source.get("type") == "base64":
+                        parts.append(
+                            {
+                                "inlineData": {
+                                    "mimeType": source.get("media_type", "image/png"),
+                                    "data": source.get("data", ""),
+                                }
+                            }
+                        )
+                elif item_type == "tool_use":
+                    tool_id = item.get("id")
+                    function_call: Dict[str, Any] = {
+                        "id": tool_id,
+                        "name": item.get("name"),
+                        "args": item.get("input", {}) or {},
+                    }
+                    # 附加 thoughtSignature（如果存在），用于满足 Gemini API 的要求
+                    # 优先从扩展字段获取，其次从预查询的 signature_map 获取
+                    thought_signature = item.get("_thought_signature")
+                    if not thought_signature and tool_id:
+                        thought_signature = signature_map.get(str(tool_id))
+                    part_obj: Dict[str, Any] = {"functionCall": function_call}
+                    if thought_signature:
+                        part_obj["thoughtSignature"] = thought_signature
+                    parts.append(part_obj)
+                elif item_type == "tool_result":
+                    output = _extract_tool_result_output(item.get("content"))
+                    tool_use_id = item.get("tool_use_id")
+                    tool_name = tool_use_map.get(str(tool_use_id), "") if tool_use_id else ""
+                    parts.append(
+                        {
+                            "functionResponse": {
+                                "id": tool_use_id,
+                                "name": tool_name,
+                                "response": {"output": output},
+                            }
+                        }
+                    )
+                else:
+                    parts.append({"text": json.dumps(item, ensure_ascii=False)})
+        else:
+            if _is_non_whitespace_text(raw_content):
+                parts = [{"text": str(raw_content)}]
+
         if not parts:
             continue
 
@@ -610,6 +933,38 @@ def convert_anthropic_request_to_antigravity_components(payload: Dict[str, Any])
         messages = []
 
     contents = convert_messages_to_contents(messages)
+    contents = reorganize_tool_messages(contents)
+    system_instruction = build_system_instruction(payload.get("system"))
+    tools = convert_tools(payload.get("tools"))
+    generation_config = build_generation_config(payload)
+
+    return {
+        "model": model,
+        "contents": contents,
+        "system_instruction": system_instruction,
+        "tools": tools,
+        "generation_config": generation_config,
+    }
+
+
+async def convert_anthropic_request_to_antigravity_components_async(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    将 Anthropic Messages 请求转换为构造下游请求所需的组件（异步版本，支持从持久化存储读取 thoughtSignature）。
+
+    返回字段：
+    - model: 下游模型名
+    - contents: 下游 contents[]
+    - system_instruction: 下游 systemInstruction（可选）
+    - tools: 下游 tools（可选）
+    - generation_config: 下游 generationConfig
+    """
+    model = map_claude_model_to_gemini(str(payload.get("model", "")))
+    messages = payload.get("messages") or []
+    if not isinstance(messages, list):
+        messages = []
+
+    # 使用异步版本的转换函数
+    contents = await convert_messages_to_contents_async(messages)
     contents = reorganize_tool_messages(contents)
     system_instruction = build_system_instruction(payload.get("system"))
     tools = convert_tools(payload.get("tools"))

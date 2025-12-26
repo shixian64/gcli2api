@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
 import uuid
 from typing import Any, Dict, Optional
-import json
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -18,7 +18,7 @@ from .antigravity_api import (
     send_antigravity_request_no_stream,
     send_antigravity_request_stream,
 )
-from .anthropic_converter import convert_anthropic_request_to_antigravity_components
+from .anthropic_converter import convert_anthropic_request_to_antigravity_components_async
 from .anthropic_streaming import antigravity_sse_to_anthropic_sse
 from .token_estimator import estimate_input_tokens
 
@@ -274,14 +274,23 @@ def _convert_antigravity_response_to_anthropic_message(
         if "functionCall" in part:
             has_tool_use = True
             fc = part.get("functionCall", {}) or {}
-            content.append(
-                {
-                    "type": "tool_use",
-                    "id": fc.get("id") or f"toolu_{uuid.uuid4().hex}",
-                    "name": fc.get("name") or "",
-                    "input": _remove_nulls_for_tool_input(fc.get("args", {}) or {}),
-                }
-            )
+            tool_id = fc.get("id") or f"toolu_{uuid.uuid4().hex}"
+            tool_use_block: Dict[str, Any] = {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": fc.get("name") or "",
+                "input": _remove_nulls_for_tool_input(fc.get("args", {}) or {}),
+            }
+            # 保存 Gemini 的 thoughtSignature，用于后续请求回传
+            # 注意：thoughtSignature 可能在 part 级别或 functionCall 内部
+            thought_signature = part.get("thoughtSignature") or fc.get("thoughtSignature")
+            if thought_signature:
+                tool_use_block["_thought_signature"] = thought_signature
+                # 同时缓存到服务端（内存+持久化），以防客户端过滤扩展字段
+                from .anthropic_converter import cache_thought_signature_async
+                # 使用 create_task 异步保存，不阻塞响应
+                asyncio.create_task(cache_thought_signature_async(str(tool_id), str(thought_signature)))
+            content.append(tool_use_block)
             continue
 
         if "inlineData" in part:
@@ -417,7 +426,7 @@ async def anthropic_messages(
     project_id, session_id = _infer_project_and_session(credential_data)
 
     try:
-        components = convert_anthropic_request_to_antigravity_components(payload)
+        components = await convert_anthropic_request_to_antigravity_components_async(payload)
     except Exception as e:
         log.error(f"[ANTHROPIC] 请求转换失败: {e}")
         return _anthropic_error(

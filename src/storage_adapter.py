@@ -71,6 +71,19 @@ class StorageBackend(Protocol):
         """删除配置项"""
         ...
 
+    # thoughtSignature 缓存管理
+    async def save_thought_signature(self, tool_use_id: str, signature: str) -> bool:
+        """保存 thoughtSignature"""
+        ...
+
+    async def get_thought_signature(self, tool_use_id: str) -> Optional[str]:
+        """获取 thoughtSignature"""
+        ...
+
+    async def cleanup_expired_thought_signatures(self) -> int:
+        """清理过期的 thoughtSignature"""
+        ...
+
 
 class StorageAdapter:
     """存储适配器，根据配置选择存储后端"""
@@ -196,6 +209,30 @@ class StorageAdapter:
         """删除配置项"""
         self._ensure_initialized()
         return await self._backend.delete_config(key)
+
+    # ============ thoughtSignature 缓存管理 ============
+
+    async def save_thought_signature(self, tool_use_id: str, signature: str) -> bool:
+        """保存 thoughtSignature 到持久化存储"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "save_thought_signature"):
+            return await self._backend.save_thought_signature(tool_use_id, signature)
+        # MongoDB 后端暂不支持，返回 False
+        return False
+
+    async def get_thought_signature(self, tool_use_id: str) -> Optional[str]:
+        """获取 thoughtSignature"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "get_thought_signature"):
+            return await self._backend.get_thought_signature(tool_use_id)
+        return None
+
+    async def cleanup_expired_thought_signatures(self) -> int:
+        """清理过期的 thoughtSignature"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "cleanup_expired_thought_signatures"):
+            return await self._backend.cleanup_expired_thought_signatures()
+        return 0
 
     # ============ 工具方法 ============
 

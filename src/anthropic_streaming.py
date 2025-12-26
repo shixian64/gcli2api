@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -52,6 +53,8 @@ class _StreamingState:
         self._current_block_type: Optional[str] = None
         self._current_block_index: int = -1
         self._current_thinking_signature: Optional[str] = None
+        # 暂存待关联的 thoughtSignature（用于 functionCall）
+        self._pending_thought_signature: Optional[str] = None
 
         self.has_tool_use: bool = False
         self.input_tokens: int = 0
@@ -240,30 +243,39 @@ async def antigravity_sse_to_anthropic_sse(
 
                 # 兼容：下游可能会把 thoughtSignature 单独作为一个空 part 发送（此时未必带 thought=true）。
                 # 只要当前处于 thinking 块且尚未记录 signature，就用 signature_delta 补发。
+                # 如果不在 thinking 块中，则暂存供后续的 functionCall 使用。
                 signature = part.get("thoughtSignature")
-                if (
-                    signature
-                    and state._current_block_type == "thinking"
-                    and not state._current_thinking_signature
-                ):
-                    evt = _sse_event(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": state._current_block_index,
-                            "delta": {"type": "signature_delta", "signature": signature},
-                        },
-                    )
-                    state._current_thinking_signature = str(signature)
-                    if message_start_sent:
-                        ready_output.append(evt)
-                    else:
-                        enqueue(evt)
-                    if _anthropic_debug_enabled():
-                        log.info(
-                            "[ANTHROPIC][thinking_signature] 已输出 signature_delta: "
-                            f"index={state._current_block_index}"
+                if signature:
+                    if (
+                        state._current_block_type == "thinking"
+                        and not state._current_thinking_signature
+                    ):
+                        evt = _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": state._current_block_index,
+                                "delta": {"type": "signature_delta", "signature": signature},
+                            },
                         )
+                        state._current_thinking_signature = str(signature)
+                        if message_start_sent:
+                            ready_output.append(evt)
+                        else:
+                            enqueue(evt)
+                        if _anthropic_debug_enabled():
+                            log.info(
+                                "[ANTHROPIC][thinking_signature] 已输出 signature_delta: "
+                                f"index={state._current_block_index}"
+                            )
+                    else:
+                        # 不在 thinking 块中，暂存供后续的 functionCall 使用
+                        state._pending_thought_signature = str(signature)
+                        if _anthropic_debug_enabled():
+                            log.info(
+                                "[ANTHROPIC][thinking_signature] 暂存 thoughtSignature 供 functionCall 使用: "
+                                f"len={len(str(signature))}"
+                            )
 
                 if part.get("thought") is True:
                     if state._current_block_type != "thinking":
@@ -379,19 +391,36 @@ async def antigravity_sse_to_anthropic_sse(
                     tool_id = fc.get("id") or f"toolu_{uuid.uuid4().hex}"
                     tool_name = fc.get("name") or ""
                     tool_args = _remove_nulls_for_tool_input(fc.get("args", {}) or {})
+                    # 提取 thoughtSignature，优先级：part 级别 > functionCall 内部 > 暂存的
+                    thought_signature = (
+                        part.get("thoughtSignature")
+                        or fc.get("thoughtSignature")
+                        or state._pending_thought_signature
+                    )
+                    # 使用后清空暂存
+                    if state._pending_thought_signature:
+                        state._pending_thought_signature = None
 
                     idx = state._next_index()
+                    # 构建 content_block，包含 _thought_signature 用于后续请求回传
+                    content_block: Dict[str, Any] = {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": {},
+                    }
+                    if thought_signature:
+                        content_block["_thought_signature"] = thought_signature
+                        # 同时缓存到服务端（内存+持久化），以防客户端过滤扩展字段
+                        from src.anthropic_converter import cache_thought_signature_async
+                        # 使用 create_task 异步保存，不阻塞流式响应
+                        asyncio.create_task(cache_thought_signature_async(str(tool_id), str(thought_signature)))
                     evt_start = _sse_event(
                         "content_block_start",
                         {
                             "type": "content_block_start",
                             "index": idx,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tool_id,
-                                "name": tool_name,
-                                "input": {},
-                            },
+                            "content_block": content_block,
                         },
                     )
 
