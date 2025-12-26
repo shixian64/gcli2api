@@ -381,10 +381,24 @@ export MONGODB_DATABASE="my_gcli_db"
 ```
 
 **步骤 2: 启动应用**
+
+**方式 1: 直接运行**
 ```bash
 # 应用会自动检测 MongoDB 配置并使用 MongoDB 存储
 python web.py
 ```
+
+**方式 2: 使用 uvicorn (推荐用于开发)**
+```bash
+# 禁用代理并启动开发服务器 (支持热重载)
+unset ALL_PROXY all_proxy && uvicorn web:app --reload --host 0.0.0.0 --port 7861
+```
+
+**参数说明**:
+- `--reload`: 代码修改后自动重启 (仅开发环境使用)
+- `--host 0.0.0.0`: 监听所有网络接口
+- `--port 7861`: 指定端口号
+- `unset ALL_PROXY all_proxy`: 清除代理环境变量 (避免代理冲突)
 
 **Docker 环境使用 MongoDB**
 ```bash

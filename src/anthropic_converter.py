@@ -225,11 +225,17 @@ def clean_json_schema(schema: Any) -> Any:
 def convert_tools(anthropic_tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
     """
     将 Anthropic tools[] 转换为下游 tools（functionDeclarations）结构。
+
+    Gemini API 要求: 所有函数声明应该在一个 functionDeclarations 数组中,
+    而不是每个函数一个独立的工具组。这样可以避免 "Multiple tools are
+    supported only when they are all search tools" 错误。
     """
     if not anthropic_tools:
         return None
 
-    gemini_tools: List[Dict[str, Any]] = []
+    # 收集所有函数声明到一个列表中
+    all_function_declarations: List[Dict[str, Any]] = []
+
     for tool in anthropic_tools:
         name = tool.get("name")
         if not name:
@@ -238,19 +244,18 @@ def convert_tools(anthropic_tools: Optional[List[Dict[str, Any]]]) -> Optional[L
         input_schema = tool.get("input_schema", {}) or {}
         parameters = clean_json_schema(input_schema)
 
-        gemini_tools.append(
-            {
-                "functionDeclarations": [
-                    {
-                        "name": name,
-                        "description": description,
-                        "parameters": parameters,
-                    }
-                ]
-            }
-        )
+        all_function_declarations.append({
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        })
 
-    return gemini_tools or None
+    if not all_function_declarations:
+        return None
+
+    # 返回单个工具组,包含所有函数声明
+    # 这符合 Gemini API 的规范,避免多工具组导致的限制
+    return [{"functionDeclarations": all_function_declarations}]
 
 
 def _extract_tool_result_output(content: Any) -> str:
@@ -274,6 +279,18 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
     将 Anthropic messages[] 转换为下游 contents[]（role: user/model, parts: []）。
     """
     contents: List[Dict[str, Any]] = []
+
+    # 构建 tool_use_id -> tool_name 的映射,用于填充 functionResponse.name
+    tool_use_map: Dict[str, str] = {}
+    for msg in messages:
+        raw_content = msg.get("content", "")
+        if isinstance(raw_content, list):
+            for item in raw_content:
+                if isinstance(item, dict) and item.get("type") == "tool_use":
+                    tool_id = item.get("id")
+                    tool_name = item.get("name")
+                    if tool_id and tool_name:
+                        tool_use_map[str(tool_id)] = str(tool_name)
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -352,11 +369,14 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
                     )
                 elif item_type == "tool_result":
                     output = _extract_tool_result_output(item.get("content"))
+                    tool_use_id = item.get("tool_use_id")
+                    # 从 tool_use_map 中查找对应的工具名称
+                    tool_name = tool_use_map.get(str(tool_use_id), "") if tool_use_id else ""
                     parts.append(
                         {
                             "functionResponse": {
-                                "id": item.get("tool_use_id"),
-                                "name": item.get("name", ""),
+                                "id": tool_use_id,
+                                "name": tool_name,  # 使用从 tool_use 中查找到的名称
                                 "response": {"output": output},
                             }
                         }
