@@ -118,6 +118,183 @@ def _anthropic_debug_enabled() -> bool:
     return str(os.getenv("ANTHROPIC_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _detect_thinking_in_history(messages: List[Dict[str, Any]]) -> tuple[bool, Optional[str]]:
+    """
+    检测历史消息中是否包含 thinking 块，并返回最后一个可用的签名
+
+    Returns:
+        (has_thinking, last_signature): 是否有 thinking 块，最后一个签名
+    """
+    has_thinking = False
+    last_signature: Optional[str] = None
+
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"):
+                has_thinking = True
+                sig = block.get("signature")
+                if sig:
+                    last_signature = sig
+
+    return has_thinking, last_signature
+
+
+def _check_last_assistant_structure(messages: List[Dict[str, Any]]) -> tuple[bool, Optional[str], int]:
+    """
+    检查最后一条 assistant 消息的结构
+
+    Returns:
+        (starts_with_thinking, first_block_type, message_index):
+        - starts_with_thinking: 是否以 thinking/redacted_thinking 开头
+        - first_block_type: 第一个块的类型
+        - message_index: 最后一条 assistant 消息的索引（-1 表示没有）
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list) or not content:
+            return False, None, i
+        first_block = content[0]
+        if isinstance(first_block, dict):
+            block_type = first_block.get("type")
+            starts_with_thinking = block_type in ("thinking", "redacted_thinking")
+            return starts_with_thinking, block_type, i
+        return False, None, i
+
+    return True, None, -1  # 没有 assistant 消息，视为满足约束
+
+
+def _fix_contents_for_thinking(
+    contents: List[Dict[str, Any]],
+    last_signature: Optional[str]
+) -> tuple[List[Dict[str, Any]], bool]:
+    """
+    第一层策略：尝试修复 contents 结构使其满足 thinking 约束
+
+    在最后一条 model 消息的 parts 开头插入占位 thinking 块
+
+    Args:
+        contents: 已转换的 contents 列表
+        last_signature: 最后一个可用的 thoughtSignature
+
+    Returns:
+        (fixed_contents, success): 修复后的 contents 和是否成功
+    """
+    if not contents or not last_signature:
+        return contents, False
+
+    # 找到最后一条 model 消息
+    for i in range(len(contents) - 1, -1, -1):
+        if contents[i].get("role") != "model":
+            continue
+
+        parts = contents[i].get("parts", [])
+        if not parts:
+            continue
+
+        # 检查是否已经以 thinking 开头
+        first_part = parts[0]
+        if isinstance(first_part, dict) and first_part.get("thought") is True:
+            return contents, True  # 已经满足约束
+
+        # 插入占位 thinking 块
+        # 使用一个最小的占位文本，避免空字符串可能的问题
+        placeholder_thinking = {
+            "text": ".",  # 最小占位符
+            "thought": True,
+            "thoughtSignature": last_signature
+        }
+
+        # 创建新的 contents（避免修改原列表）
+        new_contents = contents.copy()
+        new_contents[i] = {
+            "role": "model",
+            "parts": [placeholder_thinking] + parts
+        }
+
+        if _anthropic_debug_enabled():
+            log.info(
+                f"[ANTHROPIC][thinking-fix] 已在最后一条 model 消息前插入占位 thinking 块, "
+                f"signature_len={len(last_signature)}"
+            )
+
+        return new_contents, True
+
+    return contents, False
+
+
+def _filter_thinking_from_contents(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    第二层策略：从 contents 中过滤掉所有 thinking 块
+
+    保留 thoughtSignature 在 functionCall 上的关联
+
+    Args:
+        contents: 已转换的 contents 列表
+
+    Returns:
+        过滤后的 contents
+    """
+    filtered_contents: List[Dict[str, Any]] = []
+
+    for msg in contents:
+        role = msg.get("role")
+        parts = msg.get("parts", [])
+
+        if role != "model":
+            # 非 model 消息直接保留
+            filtered_contents.append(msg)
+            continue
+
+        # 过滤 model 消息中的 thinking 块
+        filtered_parts: List[Dict[str, Any]] = []
+        pending_signature: Optional[str] = None
+
+        for part in parts:
+            if not isinstance(part, dict):
+                filtered_parts.append(part)
+                continue
+
+            # 检查是否是 thinking 块
+            if part.get("thought") is True:
+                # 记录签名，用于传递给后续的 functionCall
+                sig = part.get("thoughtSignature")
+                if sig:
+                    pending_signature = sig
+                # 跳过 thinking 块
+                continue
+
+            # 如果是 functionCall 且没有签名，尝试附加
+            if "functionCall" in part:
+                if not part.get("thoughtSignature") and pending_signature:
+                    part = part.copy()
+                    part["thoughtSignature"] = pending_signature
+                pending_signature = None  # 使用后清空
+
+            filtered_parts.append(part)
+
+        # 如果过滤后还有 parts，保留这条消息
+        if filtered_parts:
+            filtered_contents.append({"role": role, "parts": filtered_parts})
+
+    if _anthropic_debug_enabled():
+        original_count = sum(
+            1 for msg in contents if msg.get("role") == "model"
+            for part in msg.get("parts", [])
+            if isinstance(part, dict) and part.get("thought") is True
+        )
+        log.info(f"[ANTHROPIC][thinking-filter] 已过滤 {original_count} 个 thinking 块")
+
+    return filtered_contents
+
+
 def _is_non_whitespace_text(value: Any) -> bool:
     """
     判断文本是否包含“非空白”内容。
@@ -879,11 +1056,15 @@ def build_system_instruction(system: Any) -> Optional[Dict[str, Any]]:
     return {"role": "user", "parts": parts}
 
 
-def build_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+def build_generation_config(payload: Dict[str, Any], skip_history_check: bool = False) -> Dict[str, Any]:
     """
     根据 Anthropic Messages 请求构造下游 generationConfig。
 
     默认值与 `converter.py` 保持一致，并在此基础上兼容 stop_sequences。
+
+    Args:
+        payload: Anthropic 请求 payload
+        skip_history_check: 是否跳过历史结构检测（当上层已处理时设为 True）
     """
     config: Dict[str, Any] = {
         "topP": 1,
@@ -933,33 +1114,35 @@ def build_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             thinking_config = get_thinking_config(thinking_value)
             include_thoughts = bool(thinking_config.get("includeThoughts", False))
 
-            last_assistant_first_block_type = None
-            for msg in reversed(payload.get("messages") or []):
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("role") != "assistant":
-                    continue
-                content = msg.get("content")
-                if not isinstance(content, list) or not content:
-                    continue
-                first_block = content[0]
-                if isinstance(first_block, dict):
-                    last_assistant_first_block_type = first_block.get("type")
-                else:
-                    last_assistant_first_block_type = None
-                break
+            # 历史结构检测（可被上层分层策略跳过）
+            if not skip_history_check:
+                last_assistant_first_block_type = None
+                for msg in reversed(payload.get("messages") or []):
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("role") != "assistant":
+                        continue
+                    content = msg.get("content")
+                    if not isinstance(content, list) or not content:
+                        continue
+                    first_block = content[0]
+                    if isinstance(first_block, dict):
+                        last_assistant_first_block_type = first_block.get("type")
+                    else:
+                        last_assistant_first_block_type = None
+                    break
 
-            if include_thoughts and last_assistant_first_block_type not in {
-                None,
-                "thinking",
-                "redacted_thinking",
-            }:
-                if _anthropic_debug_enabled():
-                    log.info(
-                        "[ANTHROPIC][thinking] 请求显式启用 thinking，但历史 messages 未回放 "
-                        "满足约束的 assistant thinking/redacted_thinking 起始块，已跳过下发 thinkingConfig（避免下游 400）"
-                    )
-                return config
+                if include_thoughts and last_assistant_first_block_type not in {
+                    None,
+                    "thinking",
+                    "redacted_thinking",
+                }:
+                    if _anthropic_debug_enabled():
+                        log.info(
+                            "[ANTHROPIC][thinking] 请求显式启用 thinking，但历史 messages 未回放 "
+                            "满足约束的 assistant thinking/redacted_thinking 起始块，已跳过下发 thinkingConfig（避免下游 400）"
+                        )
+                    return config
 
             max_tokens = payload.get("max_tokens")
             if include_thoughts and isinstance(max_tokens, int):
@@ -1031,6 +1214,10 @@ async def convert_anthropic_request_to_antigravity_components_async(payload: Dic
     """
     将 Anthropic Messages 请求转换为构造下游请求所需的组件（异步版本，支持从持久化存储读取 thoughtSignature）。
 
+    实现分层处理策略：
+    - 第一层：尝试修复历史结构（插入占位 thinking 块）
+    - 第二层：如果无法修复，过滤 thinking 块并禁用 thinkingConfig
+
     返回字段：
     - model: 下游模型名
     - contents: 下游 contents[]
@@ -1043,12 +1230,85 @@ async def convert_anthropic_request_to_antigravity_components_async(payload: Dic
     if not isinstance(messages, list):
         messages = []
 
-    # 使用异步版本的转换函数
+    # ========== 分层处理策略：分析历史状态 ==========
+    history_has_thinking, last_signature = _detect_thinking_in_history(messages)
+    starts_with_thinking, first_block_type, _ = _check_last_assistant_structure(messages)
+
+    # 获取 thinking 配置意图
+    thinking_value = payload.get("thinking")
+    thinking_explicitly_enabled = (
+        thinking_value is True or
+        (isinstance(thinking_value, dict) and thinking_value.get("type") == "enabled")
+    )
+    thinking_not_specified = thinking_value is None
+
+    # 判断是否需要特殊处理
+    needs_thinking_fix = False
+    should_filter_thinking = False
+    should_disable_thinking_config = False
+
+    if history_has_thinking:
+        if thinking_explicitly_enabled and not starts_with_thinking:
+            # 场景：启用 thinking，但最后 assistant 不是 thinking 开头
+            # 需要尝试修复，如果失败则过滤
+            needs_thinking_fix = True
+            log.info(
+                f"[ANTHROPIC][thinking-strategy] 检测到历史结构异常: "
+                f"thinking=enabled, last_assistant_starts_with={first_block_type}, "
+                f"has_signature={last_signature is not None}"
+            )
+        elif thinking_not_specified:
+            # 场景：未指定 thinking，但历史有 thinking 块
+            # 需要过滤，因为不启用 thinking 时不能有 thinking 块
+            should_filter_thinking = True
+            should_disable_thinking_config = True
+            log.info(
+                "[ANTHROPIC][thinking-strategy] 检测到历史有 thinking 但请求未启用, "
+                "将过滤 thinking 块"
+            )
+
+    # ========== 转换消息 ==========
     contents = await convert_messages_to_contents_async(messages)
     contents = reorganize_tool_messages(contents)
+
+    # ========== 应用分层策略 ==========
+    skip_history_check = False  # 是否跳过 build_generation_config 中的历史检测
+
+    if needs_thinking_fix:
+        # 第一层：尝试修复历史结构
+        fixed_contents, fix_success = _fix_contents_for_thinking(contents, last_signature)
+
+        if fix_success:
+            contents = fixed_contents
+            skip_history_check = True  # 修复成功，跳过历史检测
+            log.info("[ANTHROPIC][thinking-strategy] 第一层策略成功: 已修复历史结构")
+        else:
+            # 第一层失败，回退到第二层：过滤 thinking 块
+            should_filter_thinking = True
+            should_disable_thinking_config = True
+            log.warning(
+                "[ANTHROPIC][thinking-strategy] 第一层策略失败 (无可用签名), "
+                "回退到第二层: 过滤 thinking 块"
+            )
+
+    if should_filter_thinking:
+        # 第二层：过滤 thinking 块
+        contents = _filter_thinking_from_contents(contents)
+        log.info("[ANTHROPIC][thinking-strategy] 第二层策略执行: 已过滤 thinking 块")
+
+    # ========== 构建其他组件 ==========
     system_instruction = build_system_instruction(payload.get("system"))
     tools = convert_tools(payload.get("tools"))
-    generation_config = build_generation_config(payload)
+
+    # 构建 generation_config，可能需要禁用 thinkingConfig
+    if should_disable_thinking_config:
+        # 创建一个不包含 thinking 的 payload 副本
+        payload_without_thinking = {k: v for k, v in payload.items() if k != "thinking"}
+        generation_config = build_generation_config(payload_without_thinking)
+        log.info("[ANTHROPIC][thinking-strategy] 已禁用 thinkingConfig 下发")
+    else:
+        # 如果第一层策略成功修复了历史结构，跳过历史检测
+        generation_config = build_generation_config(payload, skip_history_check=skip_history_check)
 
     return {
         "model": model,
