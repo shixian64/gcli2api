@@ -24,6 +24,37 @@ from .httpx_client import create_streaming_client_with_kwargs, http_client
 from .models import Model, model_to_dict
 from .utils import ANTIGRAVITY_USER_AGENT, parse_quota_reset_timestamp
 
+
+def _is_model_capacity_exhausted(error_response: Dict[str, Any]) -> bool:
+    """
+    判断是否为“模型无容量”类 429。
+
+    典型响应：
+    - error.details[].reason == MODEL_CAPACITY_EXHAUSTED
+    - error.message 包含 "No capacity available for model"
+    """
+    try:
+        error = error_response.get("error", {}) or {}
+        if isinstance(error, dict):
+            message = str(error.get("message") or "")
+            if "No capacity available for model" in message:
+                return True
+
+            details = error.get("details", []) or []
+            if not isinstance(details, list):
+                return False
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                if detail.get("@type") != "type.googleapis.com/google.rpc.ErrorInfo":
+                    continue
+                if detail.get("reason") == "MODEL_CAPACITY_EXHAUSTED":
+                    return True
+        return False
+    except Exception:
+        return False
+
+
 async def _check_should_auto_ban(status_code: int) -> bool:
     """检查是否应该触发自动封禁"""
     return (
@@ -186,6 +217,11 @@ async def send_antigravity_request_stream(
 
         log.info(f"[ANTIGRAVITY] Using credential: {current_file} (model={model_name}, attempt {attempt + 1}/{max_retries + 1})")
 
+        # project 必须与 access_token 对应的项目一致；否则会导致下游行为不可预期。
+        project_id = credential_data.get("project_id")
+        if project_id:
+            request_body["project"] = str(project_id)
+
         # 构建请求头
         headers = build_antigravity_headers(access_token)
 
@@ -221,10 +257,14 @@ async def send_antigravity_request_stream(
 
                 # 记录错误（使用模型级 CD）
                 cooldown_until = None
+                model_capacity_exhausted = False
                 if response.status_code == 429:
                     try:
                         error_data = json.loads(error_text)
                         cooldown_until = parse_quota_reset_timestamp(error_data)
+                        model_capacity_exhausted = _is_model_capacity_exhausted(error_data)
+                        if model_capacity_exhausted and cooldown_until is None:
+                            cooldown_until = datetime.now(timezone.utc).timestamp() + 30
                         if cooldown_until:
                             log.info(
                                 f"检测到quota冷却时间: {datetime.fromtimestamp(cooldown_until, timezone.utc).isoformat()}"
@@ -253,6 +293,9 @@ async def send_antigravity_request_stream(
                 await client.aclose()
 
                 # 重试逻辑
+                if model_capacity_exhausted:
+                    raise Exception(f"Model capacity exhausted: {model_name}")
+
                 if retry_enabled and attempt < max_retries:
                     log.warning(f"[ANTIGRAVITY RETRY] Retrying ({attempt + 1}/{max_retries})")
                     await asyncio.sleep(retry_interval)
@@ -313,6 +356,11 @@ async def send_antigravity_request_no_stream(
 
         log.info(f"[ANTIGRAVITY] Using credential: {current_file} (model={model_name}, attempt {attempt + 1}/{max_retries + 1})")
 
+        # project 必须与 access_token 对应的项目一致；否则会导致下游行为不可预期。
+        project_id = credential_data.get("project_id")
+        if project_id:
+            request_body["project"] = str(project_id)
+
         # 构建请求头
         headers = build_antigravity_headers(access_token)
 
@@ -357,10 +405,14 @@ async def send_antigravity_request_no_stream(
 
                 # 记录错误（使用模型级 CD）
                 cooldown_until = None
+                model_capacity_exhausted = False
                 if response.status_code == 429:
                     try:
                         error_data = json.loads(error_body)
                         cooldown_until = parse_quota_reset_timestamp(error_data)
+                        model_capacity_exhausted = _is_model_capacity_exhausted(error_data)
+                        if model_capacity_exhausted and cooldown_until is None:
+                            cooldown_until = datetime.now(timezone.utc).timestamp() + 30
                         if cooldown_until:
                             log.info(
                                 f"检测到quota冷却时间: {datetime.fromtimestamp(cooldown_until, timezone.utc).isoformat()}"
@@ -382,6 +434,9 @@ async def send_antigravity_request_no_stream(
                     await _handle_auto_ban(credential_manager, response.status_code, current_file)
 
                 # 重试逻辑
+                if model_capacity_exhausted:
+                    raise Exception(f"Model capacity exhausted: {model_name}")
+
                 if retry_enabled and attempt < max_retries:
                     log.warning(f"[ANTIGRAVITY RETRY] Retrying ({attempt + 1}/{max_retries})")
                     await asyncio.sleep(retry_interval)

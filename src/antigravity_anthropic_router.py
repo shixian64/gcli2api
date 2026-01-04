@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -38,6 +39,276 @@ _SENSITIVE_KEYS = {
     "password",
     "secret",
 }
+
+_CLAUDE_CODE_PREFIX_SYSTEM_MARKERS = (
+    "Your task is to process Bash commands",
+    "determine the prefix of a Bash command",
+    "ONLY return the prefix",
+)
+_CLAUDE_CODE_PREFIX_USER_MARKER = "Claude Code Code Bash command prefix detection"
+
+_CLAUDE_CODE_FILEPATHS_SYSTEM_MARKERS = (
+    "Extract any file paths that this command reads or modifies.",
+    "<is_displaying_contents>",
+    "<filepaths>",
+)
+
+
+def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+
+
+def _collect_system_text(payload: Dict[str, Any]) -> str:
+    system = payload.get("system")
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        texts = []
+        for item in system:
+            if isinstance(item, str):
+                texts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+        return "\n".join(texts)
+    return ""
+
+
+def _collect_user_text(payload: Dict[str, Any]) -> str:
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        return ""
+    texts = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+            continue
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
+    return "\n".join(texts)
+
+
+def _extract_last_command(text: str) -> Optional[str]:
+    matches = re.findall(r"(?m)^Command:\s*(.+?)\s*$", text)
+    if not matches:
+        return None
+    return matches[-1].strip()
+
+
+def _extract_filepaths_command_and_output(text: str) -> tuple[Optional[str], str]:
+    m = re.search(r"(?s)\bCommand:\s*(.*?)\nOutput:\s*(.*)\Z", text)
+    if m:
+        return m.group(1).strip(), m.group(2)
+
+    # 兼容少数情况：没有显式 Output 段（或被裁剪），仅包含 Command。
+    command = _extract_last_command(text)
+    if not command:
+        return None, ""
+    return command, ""
+
+
+def _parse_simple_shell_tokens(command: str) -> list[str]:
+    command = command.strip()
+    if not command:
+        return []
+    return command.split()
+
+
+def _prefix_for_command(command: str) -> str:
+    cmd = command.strip()
+    if not cmd:
+        return "none"
+
+    # 注入/替换检测：宁可让 CLI 要求人工确认，也不要错误放行。
+    if "`" in cmd or "$(" in cmd:
+        return "command_injection_detected"
+
+    tokens = _parse_simple_shell_tokens(cmd)
+    if not tokens:
+        return "none"
+
+    # 收集前置环境变量（仅处理无空格的 KEY=VALUE 形式）
+    env_tokens: list[str] = []
+    token_index = 0
+    assignment_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S+$")
+    while token_index < len(tokens) and assignment_re.match(tokens[token_index]):
+        env_tokens.append(tokens[token_index])
+        token_index += 1
+
+    if token_index >= len(tokens):
+        return "none"
+
+    base = tokens[token_index]
+    sub = tokens[token_index + 1] if token_index + 1 < len(tokens) else None
+
+    if base == "git" and sub == "push":
+        return "none"
+
+    prefix_tokens = [*env_tokens, base]
+    if base in {"git", "gg"} and sub:
+        prefix_tokens.append(sub)
+
+    return " ".join(prefix_tokens)
+
+
+def _filepaths_for_command(command: str, output: str) -> tuple[bool, list[str]]:
+    tokens = _parse_simple_shell_tokens(command)
+    if not tokens:
+        return False, []
+
+    # 简单跳过前置 env
+    assignment_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S+$")
+    token_index = 0
+    while token_index < len(tokens) and assignment_re.match(tokens[token_index]):
+        token_index += 1
+    if token_index >= len(tokens):
+        return False, []
+
+    is_displaying_contents = False
+    filepaths: list[str] = []
+
+    stop_tokens = {"|", "||", "&&", ";", ">", ">>", "<"}
+    content_commands = {"cat", "head", "tail"}
+
+    i = token_index
+    while i < len(tokens):
+        t = tokens[i]
+        if t in stop_tokens:
+            i += 1
+            continue
+
+        # cat/head/tail：提取参数中的路径
+        if t in content_commands:
+            is_displaying_contents = True
+            j = i + 1
+            while j < len(tokens):
+                a = tokens[j]
+                if a in stop_tokens or a.startswith("|") or a.startswith(">") or a.startswith("2>"):
+                    break
+                if a.startswith("-"):
+                    j += 1
+                    continue
+                filepaths.append(a)
+                j += 1
+            i = j
+            continue
+
+        # 其它可能显示内容的命令：只标记，不强行猜路径
+        if t in {"sed", "awk", "grep", "rg", "less", "more", "bat"}:
+            is_displaying_contents = True
+
+        # git diff/show：从输出 diff 头提取
+        if t == "git":
+            sub = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if sub in {"diff", "show", "blame", "log"}:
+                is_displaying_contents = True
+                for line in output.splitlines():
+                    if line.startswith("diff --git "):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            filepaths.extend([parts[2], parts[3]])
+
+        i += 1
+
+    if not is_displaying_contents:
+        return False, []
+
+    # 去重但保序
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for p in filepaths:
+        if p in seen:
+            continue
+        seen.add(p)
+        deduped.append(p)
+
+    return True, deduped
+
+
+def _format_filepaths_response(is_displaying_contents: bool, filepaths: list[str]) -> str:
+    flag = "true" if is_displaying_contents else "false"
+    lines = ["<is_displaying_contents>", flag, "</is_displaying_contents>", "", "<filepaths>"]
+    lines.extend(filepaths)
+    lines.append("</filepaths>")
+    lines.append("")
+    return "\n".join(lines)
+
+
+async def _stream_text_response(*, message_id: str, model: str, text: str) -> AsyncIterator[bytes]:
+    yield _sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+    )
+    yield _sse_event(
+        "content_block_start",
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    )
+    yield _sse_event(
+        "content_block_delta",
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+    )
+    yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+    yield _sse_event(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    )
+    yield _sse_event("message_stop", {"type": "message_stop"})
+
+
+def _try_handle_claude_code_policy_locally(payload: Dict[str, Any]) -> Optional[str]:
+    system_text = _collect_system_text(payload)
+    user_text = _collect_user_text(payload)
+    if not user_text:
+        return None
+
+    # 1) Bash prefix detection
+    if (
+        any(marker in system_text for marker in _CLAUDE_CODE_PREFIX_SYSTEM_MARKERS)
+        or _CLAUDE_CODE_PREFIX_USER_MARKER in user_text
+    ):
+        command = _extract_last_command(user_text)
+        if not command:
+            return None
+        return _prefix_for_command(command)
+
+    # 2) filepaths extraction
+    if any(marker in system_text for marker in _CLAUDE_CODE_FILEPATHS_SYSTEM_MARKERS):
+        command, output = _extract_filepaths_command_and_output(user_text)
+        if not command:
+            return None
+        is_displaying, filepaths = _filepaths_for_command(command, output)
+        return _format_filepaths_response(is_displaying, filepaths)
+
+    return None
+
 
 def _remove_nulls_for_tool_input(value: Any) -> Any:
     """
@@ -387,6 +658,33 @@ async def anthropic_messages(
             error_type="invalid_request_error",
         )
 
+    # Claude Code CLI 的“前缀判定 / 文件路径提取”属于可确定性任务：
+    # - 小请求频繁触发
+    # - 一旦上游不稳定会导致 Bash 工具长时间卡在 Waiting
+    # 这里做本地快速返回，避免依赖下游模型。
+    local_text = _try_handle_claude_code_policy_locally(payload)
+    if local_text is not None:
+        if _anthropic_debug_enabled():
+            log.info(f"[ANTHROPIC][LOCAL_POLICY][hmt---] hit: model={model}, stream={stream}")
+        message_id = f"msg_{uuid.uuid4().hex}"
+        if stream:
+            return StreamingResponse(
+                _stream_text_response(message_id=message_id, model=str(model), text=local_text),
+                media_type="text/event-stream",
+            )
+        return JSONResponse(
+            content={
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": str(model),
+                "content": [{"type": "text", "text": local_text}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+        )
+
     try:
         client_host = request.client.host if request.client else "unknown"
         client_port = request.client.port if request.client else "unknown"
@@ -469,7 +767,12 @@ async def anthropic_messages(
             resources, cred_name, _ = await send_antigravity_request_stream(request_body, cred_mgr)
             response, stream_ctx, client = resources
         except Exception as e:
-            log.error(f"[ANTHROPIC] 下游流式请求失败: {e}")
+            err_text = str(e)
+            log.error(f"[ANTHROPIC] 下游流式请求失败: {err_text}")
+            if "Model capacity exhausted" in err_text:
+                return _anthropic_error(
+                    status_code=429, message=err_text, error_type="rate_limit_error"
+                )
             return _anthropic_error(status_code=500, message="下游请求失败", error_type="api_error")
 
         async def stream_generator():
@@ -500,7 +803,12 @@ async def anthropic_messages(
     try:
         response_data, _, _ = await send_antigravity_request_no_stream(request_body, cred_mgr)
     except Exception as e:
-        log.error(f"[ANTHROPIC] 下游非流式请求失败: {e}")
+        err_text = str(e)
+        log.error(f"[ANTHROPIC] 下游非流式请求失败: {err_text}")
+        if "Model capacity exhausted" in err_text:
+            return _anthropic_error(
+                status_code=429, message=err_text, error_type="rate_limit_error"
+            )
         return _anthropic_error(status_code=500, message="下游请求失败", error_type="api_error")
 
     anthropic_response = _convert_antigravity_response_to_anthropic_message(
