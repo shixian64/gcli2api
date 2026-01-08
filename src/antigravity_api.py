@@ -24,6 +24,84 @@ from .httpx_client import create_streaming_client_with_kwargs, http_client
 from .models import Model, model_to_dict
 from .utils import ANTIGRAVITY_USER_AGENT, parse_quota_reset_timestamp
 
+ANTIGRAVITY_SYSTEM_INSTRUCTION = (
+    "You are Antigravity, a powerful agentic AI coding assistant designed by the Google "
+    "Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER "
+    "to solve their coding task. The task may require creating a new codebase, modifying or "
+    "debugging an existing codebase, or simply answering a question.**Absolute paths only**"
+    "**Proactiveness**"
+)
+ANTIGRAVITY_FALLBACK_BASE_URLS = (
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    "https://daily-cloudcode-pa.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
+)
+
+
+def _normalize_base_url(url: str) -> str:
+    return url.strip().rstrip("/")
+
+
+async def _get_antigravity_base_urls() -> List[str]:
+    base_url = _normalize_base_url(await get_antigravity_api_url())
+    if not base_url:
+        base_url = _normalize_base_url(ANTIGRAVITY_FALLBACK_BASE_URLS[0])
+
+    known = {_normalize_base_url(url) for url in ANTIGRAVITY_FALLBACK_BASE_URLS}
+    if base_url not in known:
+        return [base_url]
+
+    ordered_urls = []
+    for candidate in (base_url, *ANTIGRAVITY_FALLBACK_BASE_URLS):
+        normalized = _normalize_base_url(candidate)
+        if normalized and normalized not in ordered_urls:
+            ordered_urls.append(normalized)
+    return ordered_urls
+
+
+def _normalize_system_instruction(system_instruction: Optional[Any]) -> Optional[Dict[str, Any]]:
+    if not system_instruction:
+        return None
+    if isinstance(system_instruction, dict):
+        return system_instruction
+    if isinstance(system_instruction, str):
+        return {"parts": [{"text": system_instruction}]}
+    return {"parts": [{"text": str(system_instruction)}]}
+
+
+def _requires_antigravity_system_instruction(model: str) -> bool:
+    model_lower = (model or "").lower()
+    return "claude" in model_lower or "gemini-3-pro" in model_lower
+
+
+def _inject_antigravity_system_instruction(
+    model: str, system_instruction: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    if not _requires_antigravity_system_instruction(model):
+        return system_instruction
+
+    normalized = _normalize_system_instruction(system_instruction) or {}
+    existing_parts = normalized.get("parts", [])
+    if not isinstance(existing_parts, list):
+        existing_parts = [existing_parts] if existing_parts else []
+
+    parts: List[Dict[str, Any]] = []
+    if (
+        existing_parts
+        and isinstance(existing_parts[0], dict)
+        and existing_parts[0].get("text") == ANTIGRAVITY_SYSTEM_INSTRUCTION
+    ):
+        parts = [part for part in existing_parts if isinstance(part, dict)]
+    else:
+        parts.append({"text": ANTIGRAVITY_SYSTEM_INSTRUCTION})
+        for part in existing_parts:
+            if isinstance(part, dict):
+                parts.append(part)
+            elif part is not None:
+                parts.append({"text": str(part)})
+
+    return {"role": "user", "parts": parts} if parts else None
+
 
 def _is_model_capacity_exhausted(error_response: Dict[str, Any]) -> bool:
     """
@@ -108,7 +186,7 @@ def build_antigravity_request_body(
         contents: 消息内容列表
         model: 模型名称
         project_id: 项目 ID
-        session_id: 会话 ID
+        session_id: 会话 ID（下游字段为 request.sessionId）
         system_instruction: 系统指令
         tools: 工具定义列表
         generation_config: 生成配置
@@ -121,13 +199,17 @@ def build_antigravity_request_body(
         "requestId": generate_request_id(),
         "model": model,
         "userAgent": "antigravity",
+        "requestType": "agent",
         "request": {
             "contents": contents,
-            "session_id": session_id,
-        }
+            "sessionId": session_id,
+        },
     }
 
     # 添加系统指令
+    system_instruction = _inject_antigravity_system_instruction(
+        model, _normalize_system_instruction(system_instruction)
+    )
     if system_instruction:
         request_body["request"]["systemInstruction"] = system_instruction
 
@@ -198,6 +280,7 @@ async def send_antigravity_request_stream(
 
     # 提取模型名称用于模型级 CD
     model_name = request_body.get("model", "")
+    base_urls = await _get_antigravity_base_urls()
 
     for attempt in range(max_retries + 1):
         # 获取可用凭证（传递模型名称）
@@ -228,88 +311,112 @@ async def send_antigravity_request_stream(
         try:
             # 发送流式请求
             client = await create_streaming_client_with_kwargs()
-            antigravity_url = await get_antigravity_api_url()
+            close_client = True
 
             try:
-                # 使用stream方法但不在async with块中消费数据
-                stream_ctx = client.stream(
-                    "POST",
-                    f"{antigravity_url}/v1internal:streamGenerateContent?alt=sse",
-                    json=request_body,
-                    headers=headers,
-                )
-                response = await stream_ctx.__aenter__()
-
-                # 检查响应状态
-                if response.status_code == 200:
-                    log.info(f"[ANTIGRAVITY] Request successful with credential: {current_file}")
-                    # 注意: 不在这里记录成功,在流式生成器中第一次收到数据时记录
-                    # 获取配置并包装响应流，在源头过滤思维链
-                    return_thoughts = await get_return_thoughts_to_frontend()
-                    filtered_lines = _filter_thinking_from_stream(response.aiter_lines(), return_thoughts)
-                    # 返回过滤后的行生成器和资源管理对象,让调用者管理资源生命周期
-                    return (filtered_lines, stream_ctx, client), current_file, credential_data
-
-                # 处理错误
-                error_body = await response.aread()
-                error_text = error_body.decode('utf-8', errors='ignore')
-                log.error(f"[ANTIGRAVITY] API error ({response.status_code}): {error_text[:500]}")
-
-                # 记录错误（使用模型级 CD）
-                cooldown_until = None
-                model_capacity_exhausted = False
-                if response.status_code == 429:
+                for base_index, antigravity_url in enumerate(base_urls):
                     try:
-                        error_data = json.loads(error_text)
-                        cooldown_until = parse_quota_reset_timestamp(error_data)
-                        model_capacity_exhausted = _is_model_capacity_exhausted(error_data)
-                        if model_capacity_exhausted and cooldown_until is None:
-                            cooldown_until = datetime.now(timezone.utc).timestamp() + 30
-                        if cooldown_until:
-                            log.info(
-                                f"检测到quota冷却时间: {datetime.fromtimestamp(cooldown_until, timezone.utc).isoformat()}"
+                        # 使用stream方法但不在async with块中消费数据
+                        stream_ctx = client.stream(
+                            "POST",
+                            f"{antigravity_url}/v1internal:streamGenerateContent?alt=sse",
+                            json=request_body,
+                            headers=headers,
+                        )
+                        response = await stream_ctx.__aenter__()
+                    except Exception as req_error:
+                        log.warning(
+                            f"[ANTIGRAVITY] Request error on base url {antigravity_url}: {req_error}"
+                        )
+                        if base_index < len(base_urls) - 1:
+                            log.warning(
+                                f"[ANTIGRAVITY] Falling back to base url {base_urls[base_index + 1]}"
                             )
-                    except Exception as parse_err:
-                        log.debug(f"[ANTIGRAVITY] Failed to parse cooldown time: {parse_err}")
+                            continue
+                        raise
 
-                await credential_manager.record_api_call_result(
-                    current_file,
-                    False,
-                    response.status_code,
-                    cooldown_until=cooldown_until,
-                    is_antigravity=True,
-                    model_key=model_name  # 传递模型名称用于模型级 CD
-                )
+                    # 检查响应状态
+                    if response.status_code == 200:
+                        log.info(f"[ANTIGRAVITY] Request successful with credential: {current_file}")
+                        # 注意: 不在这里记录成功,在流式生成器中第一次收到数据时记录
+                        # 获取配置并包装响应流，在源头过滤思维链
+                        return_thoughts = await get_return_thoughts_to_frontend()
+                        filtered_lines = _filter_thinking_from_stream(response.aiter_lines(), return_thoughts)
+                        # 返回过滤后的行生成器和资源管理对象,让调用者管理资源生命周期
+                        close_client = False
+                        return (filtered_lines, stream_ctx, client), current_file, credential_data
 
-                # 检查自动封禁
-                if await _check_should_auto_ban(response.status_code):
-                    await _handle_auto_ban(credential_manager, response.status_code, current_file)
+                    # 处理错误
+                    error_body = await response.aread()
+                    error_text = error_body.decode('utf-8', errors='ignore')
+                    log.error(f"[ANTIGRAVITY] API error ({response.status_code}): {error_text[:500]}")
 
-                # 清理资源
-                try:
-                    await stream_ctx.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                await client.aclose()
+                    should_fallback = response.status_code == 429 and base_index < len(base_urls) - 1
+                    if should_fallback:
+                        log.warning(
+                            f"[ANTIGRAVITY] Rate limited on base url {antigravity_url}, "
+                            f"retrying with {base_urls[base_index + 1]}"
+                        )
+                        try:
+                            await stream_ctx.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                        continue
 
-                # 重试逻辑
-                if model_capacity_exhausted:
-                    raise Exception(f"Model capacity exhausted: {model_name}")
+                    # 记录错误（使用模型级 CD）
+                    cooldown_until = None
+                    model_capacity_exhausted = False
+                    if response.status_code == 429:
+                        try:
+                            error_data = json.loads(error_text)
+                            cooldown_until = parse_quota_reset_timestamp(error_data)
+                            model_capacity_exhausted = _is_model_capacity_exhausted(error_data)
+                            if model_capacity_exhausted and cooldown_until is None:
+                                cooldown_until = datetime.now(timezone.utc).timestamp() + 30
+                            if cooldown_until:
+                                log.info(
+                                    f"检测到quota冷却时间: {datetime.fromtimestamp(cooldown_until, timezone.utc).isoformat()}"
+                                )
+                        except Exception as parse_err:
+                            log.debug(f"[ANTIGRAVITY] Failed to parse cooldown time: {parse_err}")
 
-                if retry_enabled and attempt < max_retries:
-                    log.warning(f"[ANTIGRAVITY RETRY] Retrying ({attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_interval)
-                    continue
+                    await credential_manager.record_api_call_result(
+                        current_file,
+                        False,
+                        response.status_code,
+                        cooldown_until=cooldown_until,
+                        is_antigravity=True,
+                        model_key=model_name  # 传递模型名称用于模型级 CD
+                    )
 
-                raise Exception(f"Antigravity API error ({response.status_code}): {error_text[:200]}")
+                    # 检查自动封禁
+                    if await _check_should_auto_ban(response.status_code):
+                        await _handle_auto_ban(credential_manager, response.status_code, current_file)
 
-            except Exception as stream_error:
-                # 确保在异常情况下也清理资源
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-                raise stream_error
+                    # 清理资源
+                    try:
+                        await stream_ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+
+                    # 重试逻辑
+                    if model_capacity_exhausted:
+                        raise Exception(f"Model capacity exhausted: {model_name}")
+
+                    if retry_enabled and attempt < max_retries:
+                        log.warning(f"[ANTIGRAVITY RETRY] Retrying ({attempt + 1}/{max_retries})")
+                        await asyncio.sleep(retry_interval)
+                        break
+
+                    raise Exception(f"Antigravity API error ({response.status_code}): {error_text[:200]}")
+                else:
+                    raise Exception("Antigravity API error: all base urls failed")
+            finally:
+                if close_client:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY] Request failed with credential {current_file}: {e}")
@@ -365,84 +472,92 @@ async def send_antigravity_request_no_stream(
         headers = build_antigravity_headers(access_token)
 
         try:
-            # 发送非流式请求
-            antigravity_url = await get_antigravity_api_url()
-
             # 使用上下文管理器确保正确的资源管理
             async with http_client.get_client(timeout=300.0) as client:
-                response = await client.post(
-                    f"{antigravity_url}/v1internal:generateContent",
-                    json=request_body,
-                    headers=headers,
-                )
-
-                # 检查响应状态
-                if response.status_code == 200:
-                    log.info(f"[ANTIGRAVITY] Request successful with credential: {current_file}")
-                    await credential_manager.record_api_call_result(
-                        current_file, True, is_antigravity=True, model_key=model_name
+                for base_index, antigravity_url in enumerate(base_urls):
+                    response = await client.post(
+                        f"{antigravity_url}/v1internal:generateContent",
+                        json=request_body,
+                        headers=headers,
                     )
-                    response_data = response.json()
 
-                    # 从源头过滤思维链
-                    return_thoughts = await get_return_thoughts_to_frontend()
-                    if not return_thoughts:
+                    # 检查响应状态
+                    if response.status_code == 200:
+                        log.info(f"[ANTIGRAVITY] Request successful with credential: {current_file}")
+                        await credential_manager.record_api_call_result(
+                            current_file, True, is_antigravity=True, model_key=model_name
+                        )
+                        response_data = response.json()
+
+                        # 从源头过滤思维链
+                        return_thoughts = await get_return_thoughts_to_frontend()
+                        if not return_thoughts:
+                            try:
+                                candidate = (response_data.get("response", {}) or {}).get("candidates", [{}])[0] or {}
+                                parts = (candidate.get("content", {}) or {}).get("parts", []) or []
+                                # 过滤掉思维链部分
+                                filtered_parts = [part for part in parts if not (isinstance(part, dict) and part.get("thought") is True)]
+                                if filtered_parts != parts:
+                                    candidate["content"]["parts"] = filtered_parts
+                            except Exception as e:
+                                log.debug(f"[ANTIGRAVITY] Failed to filter thinking from response: {e}")
+
+                        return response_data, current_file, credential_data
+
+                    # 处理错误
+                    error_body = response.text
+                    log.error(f"[ANTIGRAVITY] API error ({response.status_code}): {error_body[:500]}")
+
+                    should_fallback = response.status_code == 429 and base_index < len(base_urls) - 1
+                    if should_fallback:
+                        log.warning(
+                            f"[ANTIGRAVITY] Rate limited on base url {antigravity_url}, "
+                            f"retrying with {base_urls[base_index + 1]}"
+                        )
+                        continue
+
+                    # 记录错误（使用模型级 CD）
+                    cooldown_until = None
+                    model_capacity_exhausted = False
+                    if response.status_code == 429:
                         try:
-                            candidate = (response_data.get("response", {}) or {}).get("candidates", [{}])[0] or {}
-                            parts = (candidate.get("content", {}) or {}).get("parts", []) or []
-                            # 过滤掉思维链部分
-                            filtered_parts = [part for part in parts if not (isinstance(part, dict) and part.get("thought") is True)]
-                            if filtered_parts != parts:
-                                candidate["content"]["parts"] = filtered_parts
-                        except Exception as e:
-                            log.debug(f"[ANTIGRAVITY] Failed to filter thinking from response: {e}")
+                            error_data = json.loads(error_body)
+                            cooldown_until = parse_quota_reset_timestamp(error_data)
+                            model_capacity_exhausted = _is_model_capacity_exhausted(error_data)
+                            if model_capacity_exhausted and cooldown_until is None:
+                                cooldown_until = datetime.now(timezone.utc).timestamp() + 30
+                            if cooldown_until:
+                                log.info(
+                                    f"检测到quota冷却时间: {datetime.fromtimestamp(cooldown_until, timezone.utc).isoformat()}"
+                                )
+                        except Exception as parse_err:
+                            log.debug(f"[ANTIGRAVITY] Failed to parse cooldown time: {parse_err}")
 
-                    return response_data, current_file, credential_data
+                    await credential_manager.record_api_call_result(
+                        current_file,
+                        False,
+                        response.status_code,
+                        cooldown_until=cooldown_until,
+                        is_antigravity=True,
+                        model_key=model_name  # 传递模型名称用于模型级 CD
+                    )
 
-                # 处理错误
-                error_body = response.text
-                log.error(f"[ANTIGRAVITY] API error ({response.status_code}): {error_body[:500]}")
+                    # 检查自动封禁
+                    if await _check_should_auto_ban(response.status_code):
+                        await _handle_auto_ban(credential_manager, response.status_code, current_file)
 
-                # 记录错误（使用模型级 CD）
-                cooldown_until = None
-                model_capacity_exhausted = False
-                if response.status_code == 429:
-                    try:
-                        error_data = json.loads(error_body)
-                        cooldown_until = parse_quota_reset_timestamp(error_data)
-                        model_capacity_exhausted = _is_model_capacity_exhausted(error_data)
-                        if model_capacity_exhausted and cooldown_until is None:
-                            cooldown_until = datetime.now(timezone.utc).timestamp() + 30
-                        if cooldown_until:
-                            log.info(
-                                f"检测到quota冷却时间: {datetime.fromtimestamp(cooldown_until, timezone.utc).isoformat()}"
-                            )
-                    except Exception as parse_err:
-                        log.debug(f"[ANTIGRAVITY] Failed to parse cooldown time: {parse_err}")
+                    # 重试逻辑
+                    if model_capacity_exhausted:
+                        raise Exception(f"Model capacity exhausted: {model_name}")
 
-                await credential_manager.record_api_call_result(
-                    current_file,
-                    False,
-                    response.status_code,
-                    cooldown_until=cooldown_until,
-                    is_antigravity=True,
-                    model_key=model_name  # 传递模型名称用于模型级 CD
-                )
+                    if retry_enabled and attempt < max_retries:
+                        log.warning(f"[ANTIGRAVITY RETRY] Retrying ({attempt + 1}/{max_retries})")
+                        await asyncio.sleep(retry_interval)
+                        break
 
-                # 检查自动封禁
-                if await _check_should_auto_ban(response.status_code):
-                    await _handle_auto_ban(credential_manager, response.status_code, current_file)
-
-                # 重试逻辑
-                if model_capacity_exhausted:
-                    raise Exception(f"Model capacity exhausted: {model_name}")
-
-                if retry_enabled and attempt < max_retries:
-                    log.warning(f"[ANTIGRAVITY RETRY] Retrying ({attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_interval)
-                    continue
-
-                raise Exception(f"Antigravity API error ({response.status_code}): {error_body[:200]}")
+                    raise Exception(f"Antigravity API error ({response.status_code}): {error_body[:200]}")
+                else:
+                    raise Exception("Antigravity API error: all base urls failed")
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY] Request failed with credential {current_file}: {e}")
@@ -481,48 +596,55 @@ async def fetch_available_models(
 
     try:
         # 使用 POST 请求获取模型列表（根据 buildAxiosConfig，method 是 POST）
-        antigravity_url = await get_antigravity_api_url()
+        base_urls = await _get_antigravity_base_urls()
 
         # 使用上下文管理器确保正确的资源管理
         async with http_client.get_client(timeout=30.0) as client:
-            response = await client.post(
-                f"{antigravity_url}/v1internal:fetchAvailableModels",
-                json={},  # 空的请求体
-                headers=headers,
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                log.debug(f"[ANTIGRAVITY] Raw models response: {json.dumps(data, ensure_ascii=False)[:500]}")
-
-                # 转换为 OpenAI 格式的模型列表，使用 Model 类
-                model_list = []
-                current_timestamp = int(datetime.now(timezone.utc).timestamp())
-
-                if 'models' in data and isinstance(data['models'], dict):
-                    # 遍历模型字典
-                    for model_id in data['models'].keys():
-                        model = Model(
-                            id=model_id,
-                            object='model',
-                            created=current_timestamp,
-                            owned_by='google'
-                        )
-                        model_list.append(model_to_dict(model))
-
-                # 添加额外的 claude-opus-4-5 模型
-                claude_opus_model = Model(
-                    id='claude-opus-4-5',
-                    object='model',
-                    created=current_timestamp,
-                    owned_by='google'
+            for base_index, antigravity_url in enumerate(base_urls):
+                response = await client.post(
+                    f"{antigravity_url}/v1internal:fetchAvailableModels",
+                    json={},  # 空的请求体
+                    headers=headers,
                 )
-                model_list.append(model_to_dict(claude_opus_model))
 
-                log.info(f"[ANTIGRAVITY] Fetched {len(model_list)} available models")
-                return model_list
-            else:
+                if response.status_code == 200:
+                    data = response.json()
+                    log.debug(f"[ANTIGRAVITY] Raw models response: {json.dumps(data, ensure_ascii=False)[:500]}")
+
+                    # 转换为 OpenAI 格式的模型列表，使用 Model 类
+                    model_list = []
+                    current_timestamp = int(datetime.now(timezone.utc).timestamp())
+
+                    if 'models' in data and isinstance(data['models'], dict):
+                        # 遍历模型字典
+                        for model_id in data['models'].keys():
+                            model = Model(
+                                id=model_id,
+                                object='model',
+                                created=current_timestamp,
+                                owned_by='google'
+                            )
+                            model_list.append(model_to_dict(model))
+
+                    # 添加额外的 claude-opus-4-5 模型
+                    claude_opus_model = Model(
+                        id='claude-opus-4-5',
+                        object='model',
+                        created=current_timestamp,
+                        owned_by='google'
+                    )
+                    model_list.append(model_to_dict(claude_opus_model))
+
+                    log.info(f"[ANTIGRAVITY] Fetched {len(model_list)} available models")
+                    return model_list
+
                 log.error(f"[ANTIGRAVITY] Failed to fetch models ({response.status_code}): {response.text[:500]}")
+                if response.status_code == 429 and base_index < len(base_urls) - 1:
+                    log.warning(
+                        f"[ANTIGRAVITY] Rate limited on base url {antigravity_url}, "
+                        f"retrying with {base_urls[base_index + 1]}"
+                    )
+                    continue
                 return []
 
     except Exception as e:
@@ -556,52 +678,59 @@ async def fetch_quota_info(access_token: str) -> Dict[str, Any]:
     headers = build_antigravity_headers(access_token)
 
     try:
-        antigravity_url = await get_antigravity_api_url()
+        base_urls = await _get_antigravity_base_urls()
 
         async with http_client.get_client(timeout=30.0) as client:
-            response = await client.post(
-                f"{antigravity_url}/v1internal:fetchAvailableModels",
-                json={},
-                headers=headers,
-            )
+            for base_index, antigravity_url in enumerate(base_urls):
+                response = await client.post(
+                    f"{antigravity_url}/v1internal:fetchAvailableModels",
+                    json={},
+                    headers=headers,
+                )
 
-            if response.status_code == 200:
-                data = response.json()
-                log.debug(f"[ANTIGRAVITY QUOTA] Raw response: {json.dumps(data, ensure_ascii=False)[:500]}")
+                if response.status_code == 200:
+                    data = response.json()
+                    log.debug(f"[ANTIGRAVITY QUOTA] Raw response: {json.dumps(data, ensure_ascii=False)[:500]}")
 
-                quota_info = {}
+                    quota_info = {}
 
-                if 'models' in data and isinstance(data['models'], dict):
-                    for model_id, model_data in data['models'].items():
-                        if isinstance(model_data, dict) and 'quotaInfo' in model_data:
-                            quota = model_data['quotaInfo']
-                            remaining = quota.get('remainingFraction', 0)
-                            reset_time_raw = quota.get('resetTime', '')
+                    if 'models' in data and isinstance(data['models'], dict):
+                        for model_id, model_data in data['models'].items():
+                            if isinstance(model_data, dict) and 'quotaInfo' in model_data:
+                                quota = model_data['quotaInfo']
+                                remaining = quota.get('remainingFraction', 0)
+                                reset_time_raw = quota.get('resetTime', '')
 
-                            # 转换为北京时间
-                            reset_time_beijing = 'N/A'
-                            if reset_time_raw:
-                                try:
-                                    utc_date = datetime.fromisoformat(reset_time_raw.replace('Z', '+00:00'))
-                                    # 转换为北京时间 (UTC+8)
-                                    from datetime import timedelta
-                                    beijing_date = utc_date + timedelta(hours=8)
-                                    reset_time_beijing = beijing_date.strftime('%m-%d %H:%M')
-                                except Exception as e:
-                                    log.warning(f"[ANTIGRAVITY QUOTA] Failed to parse reset time: {e}")
+                                # 转换为北京时间
+                                reset_time_beijing = 'N/A'
+                                if reset_time_raw:
+                                    try:
+                                        utc_date = datetime.fromisoformat(reset_time_raw.replace('Z', '+00:00'))
+                                        # 转换为北京时间 (UTC+8)
+                                        from datetime import timedelta
+                                        beijing_date = utc_date + timedelta(hours=8)
+                                        reset_time_beijing = beijing_date.strftime('%m-%d %H:%M')
+                                    except Exception as e:
+                                        log.warning(f"[ANTIGRAVITY QUOTA] Failed to parse reset time: {e}")
 
-                            quota_info[model_id] = {
-                                "remaining": remaining,
-                                "resetTime": reset_time_beijing,
-                                "resetTimeRaw": reset_time_raw
-                            }
+                                quota_info[model_id] = {
+                                    "remaining": remaining,
+                                    "resetTime": reset_time_beijing,
+                                    "resetTimeRaw": reset_time_raw
+                                }
 
-                return {
-                    "success": True,
-                    "models": quota_info
-                }
-            else:
+                    return {
+                        "success": True,
+                        "models": quota_info
+                    }
+
                 log.error(f"[ANTIGRAVITY QUOTA] Failed to fetch quota ({response.status_code}): {response.text[:500]}")
+                if response.status_code == 429 and base_index < len(base_urls) - 1:
+                    log.warning(
+                        f"[ANTIGRAVITY QUOTA] Rate limited on base url {antigravity_url}, "
+                        f"retrying with {base_urls[base_index + 1]}"
+                    )
+                    continue
                 return {
                     "success": False,
                     "error": f"API返回错误: {response.status_code}"
