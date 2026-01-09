@@ -52,6 +52,35 @@ _CLAUDE_CODE_FILEPATHS_SYSTEM_MARKERS = (
     "<is_displaying_contents>",
     "<filepaths>",
 )
+_DEFAULT_MAX_TOKENS = 4096
+
+
+def _resolve_max_tokens(payload: Dict[str, Any]) -> int:
+    max_tokens = payload.get("max_tokens")
+    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool):
+        if max_tokens > 0:
+            return max_tokens
+    if isinstance(max_tokens, str):
+        stripped = max_tokens.strip()
+        if stripped.isdigit():
+            value = int(stripped)
+            if value > 0:
+                return value
+
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        budget_tokens = thinking.get("budget_tokens")
+        if isinstance(budget_tokens, int) and not isinstance(budget_tokens, bool):
+            if budget_tokens > 0:
+                return max(_DEFAULT_MAX_TOKENS, budget_tokens + 1)
+        if isinstance(budget_tokens, str):
+            stripped = budget_tokens.strip()
+            if stripped.isdigit():
+                value = int(stripped)
+                if value > 0:
+                    return max(_DEFAULT_MAX_TOKENS, value + 1)
+
+    return _DEFAULT_MAX_TOKENS
 
 
 def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
@@ -636,7 +665,9 @@ async def anthropic_messages(
     _debug_log_request_payload(request, payload)
 
     model = payload.get("model")
-    max_tokens = payload.get("max_tokens")
+    raw_max_tokens = payload.get("max_tokens")
+    max_tokens = _resolve_max_tokens(payload)
+    payload["max_tokens"] = max_tokens
     messages = payload.get("messages")
     stream = bool(payload.get("stream", False))
     thinking_present = "thinking" in payload
@@ -650,6 +681,9 @@ async def anthropic_messages(
             }
         else:
             thinking_summary = thinking_value
+
+    if raw_max_tokens is None and _anthropic_debug_enabled():
+        log.info(f"[ANTHROPIC] max_tokens missing, defaulting to {max_tokens}")
 
     if not model or max_tokens is None or not isinstance(messages, list):
         return _anthropic_error(
