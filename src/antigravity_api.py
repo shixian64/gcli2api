@@ -444,6 +444,7 @@ async def send_antigravity_request_no_stream(
 
     # 提取模型名称用于模型级 CD
     model_name = request_body.get("model", "")
+    base_urls = await _get_antigravity_base_urls()
 
     for attempt in range(max_retries + 1):
         # 获取可用凭证（传递模型名称）
